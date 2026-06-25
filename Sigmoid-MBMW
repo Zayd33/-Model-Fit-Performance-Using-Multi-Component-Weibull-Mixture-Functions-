@@ -1,0 +1,744 @@
+Full Sigmoid-Modified Bimodal Mixture Weibull R Script
+Copy the code below and paste it into RStudio. It performs the sigmoid-modified bimodal mixture Weibull analysis, produces the PDF/CDF plots, goodness-of-fit table, Monte Carlo validation, AEP/WPD tables, and comparative plots.
+R Script Code
+################################################################################
+# FULL SIGMOID-MODIFIED BIMODAL MIXTURE WEIBULL ANALYSIS
+#
+# Tasks:
+# 1. Estimate sigmoid-modified bimodal mixture Weibull parameters
+# 2. Generate combined PDF and CDF plots for all locations
+# 3. Compute AIC, BIC, RMSE, Chi-square, and Kolmogorov-Smirnov metrics
+# 4. Perform Monte Carlo validation using the fitted sigmoid model
+# 5. Compute annual energy production and wind power density
+# 6. Generate comparative AEP and WPD plots
+# 7. Export all tables and publication-quality figures
+################################################################################
+ 
+required_packages <- c("ggplot2")
+ 
+for(pkg in required_packages){
+  if(!requireNamespace(pkg, quietly = TRUE)){
+    install.packages(pkg, dependencies = TRUE)
+  }
+}
+ 
+library(ggplot2)
+ 
+options(scipen = 999)
+set.seed(12345)
+ 
+################################################################################
+# 1. INPUT FILES
+################################################################################
+ 
+data_dir_options <- c(
+  "C:/Users/ATMOSPHERIC SERVICE/Desktop/PAPER 6",
+  "C:/Users/ATMOSPHERIC SERVICE/Desktop/PAPER 6/Paper 6"
+)
+ 
+stations <- data.frame(
+  Station = c(
+    "Bauchi_Nigeria",
+    "Calabar_Nigeria",
+    "Ilorin_Nigeria",
+    "Jos_Nigeria",
+    "Kaduna_Nigeria",
+    "Kano_Nigeria",
+    "Maiduguri_Nigeria",
+    "Nsukka_Nigeria",
+    "Owerri_Nigeria",
+    "Uyo_Nigeria"
+  ),
+  File = c(
+    "Bauchi.vtc.2dp.csv",
+    "calabar.vtc.2dp.csv",
+    "Ilorin.vtc.2dp.csv",
+    "Jos.vtc.2dp.csv",
+    "Kaduna.vtc.2dp.csv",
+    "kan.vtc.2dp.csv",
+    "Maiduguri.vtc.2dp.csv",
+    "Nsukka.vtc.2dp.csv",
+    "owerri.vtc.2dp.csv",
+    "uyo.vtc.2dp.csv"
+  ),
+  stringsAsFactors = FALSE
+)
+ 
+find_input_file <- function(file_name){
+  possible_paths <- file.path(data_dir_options, file_name)
+  existing_path <- possible_paths[file.exists(possible_paths)]
+ 
+  if(length(existing_path) > 0){
+    return(existing_path[1])
+  }
+ 
+  possible_paths[1]
+}
+ 
+stations$Path <- vapply(stations$File, find_input_file, character(1))
+missing_files <- stations$Path[!file.exists(stations$Path)]
+ 
+if(length(missing_files) > 0){
+  stop("These files are missing:\n", paste(missing_files, collapse = "\n"))
+}
+ 
+################################################################################
+# 2. OUTPUT FOLDERS
+################################################################################
+ 
+output_dir <- "Sigmoid_Full_Publication_Output"
+tables_dir <- file.path(output_dir, "Tables")
+figures_dir <- file.path(output_dir, "Figures")
+ 
+for(folder in c(output_dir, tables_dir, figures_dir)){
+  if(!dir.exists(folder)){
+    dir.create(folder, recursive = TRUE)
+  }
+}
+ 
+cached_parameter_file <- file.path(
+  "Sigmoid_Bimodal_Weibull_Output",
+  "sigmoid_bimodal_weibull_parameters.csv"
+)
+ 
+cached_parameters <- NULL
+ 
+if(file.exists(cached_parameter_file)){
+  cached_parameters <- read.csv(cached_parameter_file, stringsAsFactors = FALSE)
+}
+ 
+################################################################################
+# 3. HELPER FUNCTIONS
+################################################################################
+ 
+clean_names <- function(x){
+  tolower(gsub("[^A-Za-z0-9]+", "", x))
+}
+ 
+month_to_number <- function(month_value){
+  month_text <- trimws(as.character(month_value))
+  month_number <- suppressWarnings(as.integer(month_text))
+  needs_conversion <- is.na(month_number)
+  month_number[needs_conversion] <- match(
+    tolower(substr(month_text[needs_conversion], 1, 3)),
+    tolower(month.abb)
+  )
+  month_number
+}
+ 
+read_wind_data <- function(file_path, station_name){
+  raw_data <- read.csv(file_path, stringsAsFactors = FALSE, check.names = FALSE)
+  names(raw_data) <- clean_names(names(raw_data))
+ 
+  wind_column <- intersect(
+    c("windspeed", "winspeed", "windspd", "speed"),
+    names(raw_data)
+  )
+  wind_column <- wind_column[1]
+ 
+  if(!all(c("year", "month") %in% names(raw_data))){
+    stop("Year or Month column is missing in ", station_name)
+  }
+ 
+  if(is.na(wind_column)){
+    stop("Wind speed column is missing in ", station_name)
+  }
+ 
+  data <- data.frame(
+    Station = station_name,
+    Year = as.integer(raw_data$year),
+    Month = month_to_number(raw_data$month),
+    WindSpeed = suppressWarnings(as.numeric(raw_data[[wind_column]]))
+  )
+ 
+  data <- data[complete.cases(data), ]
+  data <- data[data$WindSpeed >= 0, ]
+  data
+}
+ 
+origin_theme <- function(){
+  theme_bw(base_size = 12) +
+    theme(
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.9),
+      axis.line = element_line(color = "black", linewidth = 0.6),
+      axis.ticks = element_line(color = "black", linewidth = 0.6),
+      axis.minor.ticks.length = unit(0, "pt"),
+      panel.grid.major = element_line(color = "grey85", linewidth = 0.25),
+      panel.grid.minor = element_blank(),
+      axis.text = element_text(color = "black", face = "bold"),
+      axis.title = element_text(color = "black", face = "bold"),
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.title = element_text(face = "bold"),
+      legend.text = element_text(size = 9),
+      strip.background = element_rect(fill = "grey90", color = "black"),
+      strip.text = element_text(face = "bold", color = "black")
+    )
+}
+ 
+sigmoid_function <- function(x, alpha, center){
+  1 / (1 + exp(-alpha * (x - center)))
+}
+ 
+component_normalizers <- function(shape1, scale1, shape2, scale2, alpha, center, upper_limit){
+  z1 <- integrate(
+    function(z){
+      sigmoid_function(z, alpha, center) *
+        dweibull(z, shape = shape1, scale = scale1)
+    },
+    lower = 0,
+    upper = upper_limit,
+    subdivisions = 1000,
+    rel.tol = 0.000001
+  )$value
+ 
+  z2 <- integrate(
+    function(z){
+      (1 - sigmoid_function(z, alpha, center)) *
+        dweibull(z, shape = shape2, scale = scale2)
+    },
+    lower = 0,
+    upper = upper_limit,
+    subdivisions = 1000,
+    rel.tol = 0.000001
+  )$value
+ 
+  c(z1 = max(z1, 0.000000000001), z2 = max(z2, 0.000000000001))
+}
+ 
+sigmoid_bimodal_weibull_pdf <- function(
+    x, weight1, shape1, scale1, shape2, scale2, alpha, center, upper_limit){
+ 
+  normalizers <- component_normalizers(
+    shape1, scale1, shape2, scale2, alpha, center, upper_limit
+  )
+ 
+  s <- sigmoid_function(x, alpha, center)
+  component1 <- s * dweibull(x, shape = shape1, scale = scale1) / normalizers["z1"]
+  component2 <- (1 - s) * dweibull(x, shape = shape2, scale = scale2) / normalizers["z2"]
+ 
+  pmax(weight1 * component1 + (1 - weight1) * component2, 0.000000000001)
+}
+ 
+sigmoid_bimodal_weibull_cdf <- function(
+    x, weight1, shape1, scale1, shape2, scale2, alpha, center, upper_limit){
+ 
+  normalizers <- component_normalizers(
+    shape1, scale1, shape2, scale2, alpha, center, upper_limit
+  )
+ 
+  one_value <- function(q){
+    if(q <= 0){
+      return(0)
+    }
+ 
+    upper_q <- min(q, upper_limit)
+ 
+    c1 <- integrate(
+      function(z){
+        sigmoid_function(z, alpha, center) *
+          dweibull(z, shape = shape1, scale = scale1) / normalizers["z1"]
+      },
+      lower = 0,
+      upper = upper_q,
+      subdivisions = 1000,
+      rel.tol = 0.000001
+    )$value
+ 
+    c2 <- integrate(
+      function(z){
+        (1 - sigmoid_function(z, alpha, center)) *
+          dweibull(z, shape = shape2, scale = scale2) / normalizers["z2"]
+      },
+      lower = 0,
+      upper = upper_q,
+      subdivisions = 1000,
+      rel.tol = 0.000001
+    )$value
+ 
+    min(max(weight1 * c1 + (1 - weight1) * c2, 0), 1)
+  }
+ 
+  vapply(x, one_value, numeric(1))
+}
+ 
+trapezoid_integral <- function(x, y){
+  sum((y[-1] + y[-length(y)]) / 2 * diff(x))
+}
+ 
+sigmoid_bimodal_weibull_pdf_fast <- function(
+    x, weight1, shape1, scale1, shape2, scale2, alpha, center, norm_grid){
+ 
+  s_grid <- sigmoid_function(norm_grid, alpha, center)
+  g1_grid <- s_grid * dweibull(norm_grid, shape = shape1, scale = scale1)
+  g2_grid <- (1 - s_grid) * dweibull(norm_grid, shape = shape2, scale = scale2)
+ 
+  z1 <- max(trapezoid_integral(norm_grid, g1_grid), 0.000000000001)
+  z2 <- max(trapezoid_integral(norm_grid, g2_grid), 0.000000000001)
+ 
+  s <- sigmoid_function(x, alpha, center)
+  component1 <- s * dweibull(x, shape = shape1, scale = scale1) / z1
+  component2 <- (1 - s) * dweibull(x, shape = shape2, scale = scale2) / z2
+ 
+  pmax(weight1 * component1 + (1 - weight1) * component2, 0.000000000001)
+}
+ 
+negative_log_likelihood <- function(parameters, x, alpha, center, norm_grid){
+  density <- sigmoid_bimodal_weibull_pdf_fast(
+    x = x,
+    weight1 = parameters[1],
+    shape1 = parameters[2],
+    scale1 = parameters[3],
+    shape2 = parameters[4],
+    scale2 = parameters[5],
+    alpha = alpha,
+    center = center,
+    norm_grid = norm_grid
+  )
+  -sum(log(density))
+}
+ 
+fit_sigmoid_model <- function(x){
+  center <- mean(x)
+  alpha <- 1 / sd(x)
+  upper_limit <- max(x) * 5
+  norm_grid <- seq(0, upper_limit, length.out = 2000)
+ 
+  start <- c(
+    weight1 = 0.50,
+    shape1 = 2.00,
+    scale1 = max(mean(x) * 0.75, 0.10),
+    shape2 = 3.00,
+    scale2 = max(mean(x) * 1.25, 0.10)
+  )
+ 
+  fit <- optim(
+    par = start,
+    fn = negative_log_likelihood,
+    x = x,
+    alpha = alpha,
+    center = center,
+    norm_grid = norm_grid,
+    method = "L-BFGS-B",
+    lower = c(0.001, 0.10, 0.10, 0.10, 0.10),
+    upper = c(0.999, 20.00, 50.00, 20.00, 50.00),
+    control = list(maxit = 1000)
+  )
+ 
+  grid_x <- seq(0, upper_limit, length.out = 5000)
+  grid_pdf <- sigmoid_bimodal_weibull_pdf_fast(
+    x = grid_x,
+    weight1 = fit$par[1],
+    shape1 = fit$par[2],
+    scale1 = fit$par[3],
+    shape2 = fit$par[4],
+    scale2 = fit$par[5],
+    alpha = alpha,
+    center = center,
+    norm_grid = norm_grid
+  )
+ 
+  dx <- diff(grid_x)
+  grid_cdf <- c(0, cumsum((grid_pdf[-1] + grid_pdf[-length(grid_pdf)]) / 2 * dx))
+  grid_cdf <- grid_cdf / max(grid_cdf)
+  grid_probability <- grid_pdf / sum(grid_pdf)
+ 
+  list(
+    parameters = fit$par,
+    alpha = alpha,
+    center = center,
+    upper_limit = upper_limit,
+    norm_grid = norm_grid,
+    grid_x = grid_x,
+    grid_pdf = grid_pdf,
+    grid_cdf = grid_cdf,
+    grid_probability = grid_probability,
+    nll = fit$value,
+    convergence = fit$convergence
+  )
+}
+ 
+make_fit_from_parameters <- function(x, parameter_row){
+  upper_limit <- max(x) * 5
+  norm_grid <- seq(0, upper_limit, length.out = 2000)
+  parameters <- c(
+    weight1 = parameter_row$Weight_1,
+    shape1 = parameter_row$Shape_1,
+    scale1 = parameter_row$Scale_1,
+    shape2 = parameter_row$Shape_2,
+    scale2 = parameter_row$Scale_2
+  )
+ 
+  grid_x <- seq(0, upper_limit, length.out = 5000)
+  grid_pdf <- sigmoid_bimodal_weibull_pdf_fast(
+    x = grid_x,
+    weight1 = parameters[1],
+    shape1 = parameters[2],
+    scale1 = parameters[3],
+    shape2 = parameters[4],
+    scale2 = parameters[5],
+    alpha = parameter_row$Sigmoid_Alpha,
+    center = parameter_row$Sigmoid_Center,
+    norm_grid = norm_grid
+  )
+ 
+  dx <- diff(grid_x)
+  grid_cdf <- c(0, cumsum((grid_pdf[-1] + grid_pdf[-length(grid_pdf)]) / 2 * dx))
+  grid_cdf <- grid_cdf / max(grid_cdf)
+  grid_probability <- grid_pdf / sum(grid_pdf)
+ 
+  list(
+    parameters = parameters,
+    alpha = parameter_row$Sigmoid_Alpha,
+    center = parameter_row$Sigmoid_Center,
+    upper_limit = upper_limit,
+    norm_grid = norm_grid,
+    grid_x = grid_x,
+    grid_pdf = grid_pdf,
+    grid_cdf = grid_cdf,
+    grid_probability = grid_probability,
+    nll = negative_log_likelihood(
+      parameters,
+      x = x,
+      alpha = parameter_row$Sigmoid_Alpha,
+      center = parameter_row$Sigmoid_Center,
+      norm_grid = norm_grid
+    ),
+    convergence = parameter_row$Convergence_Code
+  )
+}
+ 
+model_pdf <- function(x, fit){
+  p <- fit$parameters
+  sigmoid_bimodal_weibull_pdf_fast(
+    x, p[1], p[2], p[3], p[4], p[5],
+    fit$alpha, fit$center, fit$norm_grid
+  )
+}
+ 
+model_cdf <- function(x, fit){
+  approx(
+    x = fit$grid_x,
+    y = fit$grid_cdf,
+    xout = x,
+    rule = 2,
+    ties = "ordered"
+  )$y
+}
+ 
+compute_gof <- function(x, fit){
+  x_sorted <- sort(x)
+  empirical <- ecdf(x)(x_sorted)
+  theoretical <- model_cdf(x_sorted, fit)
+  residuals <- empirical - theoretical
+ 
+  n <- length(x)
+  n_params <- 5
+  log_likelihood <- -fit$nll
+ 
+  breaks <- unique(as.numeric(quantile(
+    x, probs = seq(0, 1, length.out = 9), type = 7, na.rm = TRUE
+  )))
+  observed <- as.numeric(table(cut(x, breaks = breaks, include.lowest = TRUE)))
+  cdf_upper <- model_cdf(breaks[-1], fit)
+  cdf_lower <- model_cdf(breaks[-length(breaks)], fit)
+  expected <- n * pmax(cdf_upper - cdf_lower, 0.000000000001)
+  chi_square <- sum((observed - expected)^2 / expected)
+  chi_df <- length(observed) - n_params - 1
+  chi_p <- if(chi_df > 0) pchisq(chi_square, chi_df, lower.tail = FALSE) else NA
+ 
+  data.frame(
+    AIC = -2 * log_likelihood + 2 * n_params,
+    BIC = -2 * log_likelihood + log(n) * n_params,
+    RMSE = sqrt(mean(residuals^2)),
+    Chi_Square = chi_square,
+    Chi_Square_DF = chi_df,
+    Chi_Square_PValue = chi_p,
+    Kolmogorov_Smirnov = max(abs(residuals))
+  )
+}
+ 
+simulate_sigmoid_model <- function(n, fit){
+  sample(fit$grid_x, size = n, replace = TRUE, prob = fit$grid_probability)
+}
+ 
+compute_wpd <- function(wind_speed, air_density = 1.225){
+  0.5 * air_density * wind_speed^3
+}
+ 
+compute_aep <- function(
+    mean_wind_speed,
+    air_density = 1.225,
+    rotor_radius = 40,
+    power_coefficient = 0.40,
+    availability = 0.95,
+    hours_per_year = 8760){
+ 
+  swept_area <- pi * rotor_radius^2
+  power_watts <- 0.5 * air_density * swept_area * power_coefficient *
+    mean_wind_speed^3
+  power_watts * availability * hours_per_year / 1000000
+}
+ 
+round_numeric_columns <- function(data, digits = 5){
+  numeric_cols <- vapply(data, is.numeric, logical(1))
+  data[numeric_cols] <- lapply(data[numeric_cols], round, digits = digits)
+  data
+}
+ 
+save_plot <- function(plot_object, file_path, width = 12, height = 8){
+  ggsave(file_path, plot_object, width = width, height = height, dpi = 600)
+}
+ 
+################################################################################
+# 4. MAIN ANALYSIS
+################################################################################
+ 
+all_cleaned <- list()
+all_parameters <- list()
+all_gof <- list()
+all_pdf <- list()
+all_cdf <- list()
+all_empirical_cdf <- list()
+all_monte_carlo <- list()
+all_energy <- list()
+all_wpd <- list()
+fits <- list()
+ 
+for(i in seq_len(nrow(stations))){
+  station_name <- stations$Station[i]
+  message("Processing ", station_name, "...")
+ 
+  data <- read_wind_data(stations$Path[i], station_name)
+  wind_speed <- data$WindSpeed
+  if(!is.null(cached_parameters) && station_name %in% cached_parameters$Station){
+    parameter_row <- cached_parameters[cached_parameters$Station == station_name, ][1, ]
+    fit <- make_fit_from_parameters(wind_speed, parameter_row)
+  } else {
+    fit <- fit_sigmoid_model(wind_speed)
+  }
+  fits[[station_name]] <- fit
+ 
+  p <- fit$parameters
+  parameter_table <- data.frame(
+    Station = station_name,
+    Weight_1 = p[1],
+    Weight_2 = 1 - p[1],
+    Shape_1 = p[2],
+    Scale_1 = p[3],
+    Shape_2 = p[4],
+    Scale_2 = p[5],
+    Sigmoid_Alpha = fit$alpha,
+    Sigmoid_Center = fit$center,
+    Negative_Log_Likelihood = fit$nll,
+    Convergence_Code = fit$convergence
+  )
+ 
+  gof <- compute_gof(wind_speed, fit)
+  gof$Station <- station_name
+  gof <- gof[, c("Station", setdiff(names(gof), "Station"))]
+ 
+  x_grid <- seq(min(wind_speed), max(wind_speed), length.out = 300)
+ 
+  pdf_data <- data.frame(
+    Station = station_name,
+    WindSpeed = x_grid,
+    FittedPDF = model_pdf(x_grid, fit)
+  )
+ 
+  cdf_data <- data.frame(
+    Station = station_name,
+    WindSpeed = x_grid,
+    FittedCDF = model_cdf(x_grid, fit)
+  )
+ 
+  empirical_cdf <- data.frame(
+    Station = station_name,
+    WindSpeed = sort(wind_speed),
+    EmpiricalCDF = ecdf(wind_speed)(sort(wind_speed))
+  )
+ 
+  mc <- data.frame()
+  for(simulation in 1:1000){
+    simulated <- simulate_sigmoid_model(length(wind_speed), fit)
+    mc <- rbind(
+      mc,
+      data.frame(
+        Station = station_name,
+        Simulation = simulation,
+        Simulated_Mean = mean(simulated),
+        Simulated_SD = sd(simulated),
+        Observed_Mean = mean(wind_speed),
+        Observed_SD = sd(wind_speed)
+      )
+    )
+  }
+ 
+  data$WPD <- compute_wpd(data$WindSpeed)
+ 
+  annual_energy <- aggregate(
+    WindSpeed ~ Station + Year,
+    data = data,
+    FUN = mean
+  )
+  names(annual_energy) <- c("Station", "Year", "Mean_WindSpeed")
+  annual_energy$AEP_MWh <- compute_aep(annual_energy$Mean_WindSpeed)
+ 
+  annual_wpd <- aggregate(
+    WPD ~ Station + Year,
+    data = data,
+    FUN = mean
+  )
+  names(annual_wpd) <- c("Station", "Year", "Mean_WPD")
+ 
+  all_cleaned[[station_name]] <- data
+  all_parameters[[station_name]] <- parameter_table
+  all_gof[[station_name]] <- gof
+  all_pdf[[station_name]] <- pdf_data
+  all_cdf[[station_name]] <- cdf_data
+  all_empirical_cdf[[station_name]] <- empirical_cdf
+  all_monte_carlo[[station_name]] <- mc
+  all_energy[[station_name]] <- annual_energy
+  all_wpd[[station_name]] <- annual_wpd
+}
+ 
+combined_cleaned <- do.call(rbind, all_cleaned)
+combined_parameters <- round_numeric_columns(do.call(rbind, all_parameters), 5)
+combined_gof <- round_numeric_columns(do.call(rbind, all_gof), 5)
+combined_pdf <- do.call(rbind, all_pdf)
+combined_cdf <- do.call(rbind, all_cdf)
+combined_empirical_cdf <- do.call(rbind, all_empirical_cdf)
+combined_monte_carlo <- round_numeric_columns(do.call(rbind, all_monte_carlo), 5)
+combined_energy <- round_numeric_columns(do.call(rbind, all_energy), 5)
+combined_wpd <- round_numeric_columns(do.call(rbind, all_wpd), 5)
+ 
+################################################################################
+# 5. SAVE TABLES
+################################################################################
+ 
+write.csv(combined_parameters, file.path(tables_dir, "sigmoid_model_parameters.csv"), row.names = FALSE)
+write.csv(combined_gof, file.path(tables_dir, "sigmoid_goodness_of_fit_metrics.csv"), row.names = FALSE)
+write.csv(combined_monte_carlo, file.path(tables_dir, "sigmoid_monte_carlo_validation.csv"), row.names = FALSE)
+write.csv(combined_energy, file.path(tables_dir, "annual_energy_production_all_locations.csv"), row.names = FALSE)
+write.csv(combined_wpd, file.path(tables_dir, "wind_power_density_all_locations.csv"), row.names = FALSE)
+ 
+################################################################################
+# 6. PDF AND CDF PLOTS
+################################################################################
+ 
+pdf_plot <- ggplot(combined_cleaned, aes(x = WindSpeed)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 18,
+    fill = "grey85",
+    color = "black",
+    linewidth = 0.25
+  ) +
+  geom_line(
+    data = combined_pdf,
+    aes(x = WindSpeed, y = FittedPDF, color = "Sigmoid-BMW PDF"),
+    linewidth = 1
+  ) +
+  scale_color_manual(name = "Legend", values = c("Sigmoid-BMW PDF" = "red")) +
+  facet_wrap(~ Station, scales = "free", ncol = 2) +
+  scale_x_continuous(minor_breaks = NULL) +
+  scale_y_continuous(minor_breaks = NULL) +
+  labs(
+    title = "Sigmoid-Modified Bimodal Weibull PDF Fits",
+    x = "Wind speed (m/s)",
+    y = "Probability density"
+  ) +
+  origin_theme()
+ 
+cdf_plot <- ggplot() +
+  geom_step(
+    data = combined_empirical_cdf,
+    aes(x = WindSpeed, y = EmpiricalCDF, color = "Empirical CDF"),
+    linewidth = 0.75
+  ) +
+  geom_line(
+    data = combined_cdf,
+    aes(x = WindSpeed, y = FittedCDF, color = "Sigmoid-BMW CDF"),
+    linewidth = 0.95
+  ) +
+  scale_color_manual(
+    name = "Legend",
+    values = c("Empirical CDF" = "blue", "Sigmoid-BMW CDF" = "red")
+  ) +
+  facet_wrap(~ Station, scales = "free_x", ncol = 2) +
+  scale_x_continuous(minor_breaks = NULL) +
+  scale_y_continuous(minor_breaks = NULL) +
+  labs(
+    title = "Empirical and Sigmoid-Modified Bimodal Weibull CDFs",
+    x = "Wind speed (m/s)",
+    y = "Cumulative probability"
+  ) +
+  origin_theme()
+ 
+save_plot(pdf_plot, file.path(figures_dir, "combined_sigmoid_pdf_all_locations.png"), 12, 14)
+save_plot(cdf_plot, file.path(figures_dir, "combined_sigmoid_cdf_all_locations.png"), 12, 14)
+ 
+################################################################################
+# 7. MONTE CARLO, AEP, AND WPD PLOTS
+################################################################################
+ 
+mc_plot <- ggplot(combined_monte_carlo, aes(x = Simulated_Mean)) +
+  geom_histogram(
+    aes(fill = "Simulated means"),
+    bins = 35,
+    color = "black",
+    linewidth = 0.25
+  ) +
+  geom_vline(
+    aes(xintercept = Observed_Mean, color = "Observed mean"),
+    linewidth = 1
+  ) +
+  scale_fill_manual(name = "Legend", values = c("Simulated means" = "skyblue")) +
+  scale_color_manual(name = "Legend", values = c("Observed mean" = "red")) +
+  facet_wrap(~ Station, scales = "free_x", ncol = 2) +
+  scale_x_continuous(minor_breaks = NULL) +
+  scale_y_continuous(minor_breaks = NULL) +
+  labs(
+    title = "Monte Carlo Validation Using Sigmoid-Modified Model",
+    x = "Simulated mean wind speed (m/s)",
+    y = "Frequency"
+  ) +
+  origin_theme()
+ 
+aep_plot <- ggplot(
+  combined_energy,
+  aes(x = Year, y = AEP_MWh, color = Station, group = Station)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  scale_x_continuous(minor_breaks = NULL) +
+  scale_y_continuous(minor_breaks = NULL) +
+  labs(
+    title = "Comparative Annual Energy Production",
+    x = "Year",
+    y = "AEP (MWh/year)",
+    color = "Location"
+  ) +
+  origin_theme()
+ 
+wpd_plot <- ggplot(
+  combined_wpd,
+  aes(x = Year, y = Mean_WPD, color = Station, group = Station)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  scale_x_continuous(minor_breaks = NULL) +
+  scale_y_continuous(minor_breaks = NULL) +
+  labs(
+    title = "Comparative Wind Power Density",
+    x = "Year",
+    y = "Wind power density (W/m2)",
+    color = "Location"
+  ) +
+  origin_theme()
+ 
+save_plot(mc_plot, file.path(figures_dir, "combined_sigmoid_monte_carlo_validation.png"), 12, 14)
+save_plot(aep_plot, file.path(figures_dir, "comparative_annual_energy_production.png"), 12, 7)
+save_plot(wpd_plot, file.path(figures_dir, "comparative_wind_power_density.png"), 12, 7)
+ 
+cat("\nFull sigmoid-modified bimodal Weibull analysis completed successfully.\n")
+cat("Output folder: ", output_dir, "\n", sep = "")
